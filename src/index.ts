@@ -1,3 +1,4 @@
+import { AsyncStorage } from 'react-native';
 import sqliteDriver from './drivers/sqlite';
 import * as _mapValues from 'lodash.mapvalues';
 import * as _merge from 'lodash.merge';
@@ -10,7 +11,7 @@ import {
     IFetchResponse,
     ICachedData,
     ICacheDictionary,
-    IAPICacheDriver,
+    IAPIDriver,
     APIMiddleware,
     IMiddlewarePaths,
     IHTTPMethods
@@ -19,58 +20,49 @@ import {
 const DEFAULT_API_OPTIONS = {
     debugAPI: false,
     prefixes: { default: '/' },
-    encodeParameters: false,
     printNetworkRequests: false,
     disableCache: false,
     cacheExpiration: 5 * 60 * 1000,
-    cachePrefix: 'APIPelineCache',
+    cachePrefix: 'offlineApiCache',
     ignoreHeadersWhenCaching: false,
     capServices: false,
     capLimit: 50
 };
 
-const DEFAULT_SERVICE_OPTIONS: IAPIService = {
+const DEFAULT_SERVICE_OPTIONS = {
     method: 'GET',
     domain: 'default',
     prefix: 'default'
 };
 
+const DEFAULT_CACHE_DRIVER = AsyncStorage;
 const HTTP_METHODS = ['GET', 'HEAD', 'POST', 'PUT', 'DELETE', 'CONNECT', 'OPTIONS', 'TRACE'];
 
 export const drivers = { sqliteDriver };
-export default class APIpeline {
+export default class OfflineFirstAPI {
 
     private _APIOptions: IAPIOptions;
     private _APIServices: IAPIServices = {};
-    private _APICacheDriver: IAPICacheDriver;
-    private _warnedAboutMissingDriver: boolean = false;
+    private _APIDriver: IAPIDriver = DEFAULT_CACHE_DRIVER;
 
-    constructor (options: IAPIOptions, services: IAPIServices, driver?: IAPICacheDriver) {
+    constructor (options: IAPIOptions, services: IAPIServices, driver?: IAPIDriver) {
         options && this.setOptions(options);
         services && this.setServices(services);
         driver && this.setCacheDriver(driver);
 
         this._createHTTPMethods();
+    }
 
-        if (!this._APIOptions.fetchMethod) {
-            throw new Error(
-                'Your fetch method is undefined. make sure to set `fetchMethod` in your API options. ' +
-                'Check out the documentation to find setting examples for the browser / node / react-native'
-            );
-        }
+    _createHTTPMethods () {
+        HTTP_METHODS.forEach((method: IHTTPMethods) => {
+            this[method.toLocaleLowerCase()] = async (...args: any[]) => this.fetch(args[0], args[1], method);
+        });
     }
 
     public async fetch (service: string, options?: IFetchOptions, forcedHTTPMethod?: IHTTPMethods): Promise<any> {
         const serviceDefinition: IAPIService = this._APIServices[service];
         if (!serviceDefinition) {
             throw new Error(`Cannot fetch data from unregistered service '${service}'`);
-        }
-        if (!this._APICacheDriver && !this._warnedAboutMissingDriver) {
-            this._log(
-                'No caching driver set. Remember set it as the 3rd argument of APIPeline ' +
-                'or use the `setCacheDriver` method before firing requests. Nothing will be cached for now.'
-            );
-            this._warnedAboutMissingDriver = true;
         }
         const { fullPath, withoutQueryParams } = this._constructPath(serviceDefinition, options);
 
@@ -89,18 +81,15 @@ export default class APIpeline {
             const fetchHeaders = options && options.fetchHeaders;
             const shouldUseCache = this._shouldUseCache(serviceDefinition, options);
             let expiration;
-            let requestId;
-            if (shouldUseCache) {
-                requestId = this._buildRequestId(serviceDefinition, fullPath, fetchHeaders, fetchOptions, options);
+            const requestId = this._buildRequestId(serviceDefinition, fullPath, fetchHeaders, fetchOptions, options);
 
-                // Expiration priority : option parameter of fetch() > service definition > default setting
-                const expirationDelay =
-                    (options && options.expiration) || serviceDefinition.expiration || this._APIOptions.cacheExpiration;
-                expiration = Date.now() + expirationDelay;
-            }
-            const cachedData = await this._getCachedData(service, requestId, fullPath, shouldUseCache);
+            // Expiration priority : option parameter of fetch() > service definition > default setting
+            const expirationDelay =
+                (options && options.expiration) || serviceDefinition.expiration || this._APIOptions.cacheExpiration;
+            expiration = Date.now() + expirationDelay;
+            const cachedData = await this._getCachedData(service, requestId, fullPath);
 
-            if (cachedData.success && cachedData.fresh) {
+            if (cachedData.success && cachedData.fresh && shouldUseCache) {
                 this._log(`Using fresh cache for ${fullPath}`);
                 return cachedData.data;
             }
@@ -179,7 +168,7 @@ export default class APIpeline {
                 keysToRemove = await this._getAllKeysForService(service);
             }
             this._log('keys to be removed', keysToRemove);
-            await Promise.all(keysToRemove.map((key: string) => this._APICacheDriver.removeItem(key)));
+            await this._APIDriver.multiRemove(keysToRemove);
             return;
         } catch (err) {
             throw new Error(err);
@@ -193,7 +182,7 @@ export default class APIpeline {
         if (!this._APIOptions.domains.default) {
             throw new Error(
                 "You didn't set your default domain URL in your options. \n " +
-                "new APIpeline({ domains: { default: 'http://myApi.net' } }, ...)"
+                "new OfflineFirstAPI({ domains: { default: 'http://myApi.net' } }, ...)"
             );
         }
     }
@@ -203,15 +192,9 @@ export default class APIpeline {
         this._log('services set to', this._APIServices);
     }
 
-    public setCacheDriver (driver: IAPICacheDriver): void {
-        this._APICacheDriver = driver;
+    public setCacheDriver (driver: IAPIDriver): void {
+        this._APIDriver = driver;
         this._log('custom driver set');
-    }
-
-    private _createHTTPMethods () {
-        HTTP_METHODS.forEach((method: IHTTPMethods) => {
-            this[method.toLocaleLowerCase()] = async (...args: any[]) => this.fetch(args[0], args[1], method);
-        });
     }
 
     /**
@@ -221,13 +204,12 @@ export default class APIpeline {
      * @param {string} url
      * @param {*} [options]
      * @returns {Promise<IFetchResponse>}
-     * @memberof APIpeline
+     * @memberof OfflineFirstAPI
      */
     private async _fetch (url: string, options?: any): Promise<IFetchResponse> {
         try {
-            return { success: true, data: await this._APIOptions.fetchMethod(url, options) };
+            return { success: true, data: await fetch(url, options) };
         } catch (err) {
-            console.warn(err);
             return { success: false };
         }
     }
@@ -241,7 +223,7 @@ export default class APIpeline {
      * @param {*} response
      * @param {number} expiration
      * @returns {(Promise<void|boolean>)}
-     * @memberof APIpeline
+     * @memberof OfflineFirstAPI
      */
     private async _cache (
         serviceDefinition: IAPIService,
@@ -258,7 +240,7 @@ export default class APIpeline {
         try {
             this._log(`Caching ${requestId} ...`);
             await this._addKeyToServiceDictionary(service, requestId, expiration);
-            await this._APICacheDriver.setItem(this._getCacheObjectKey(requestId), JSON.stringify(response));
+            await this._APIDriver.setItem(this._getCacheObjectKey(requestId), JSON.stringify(response));
             this._log(`Updated cache for request ${requestId}`);
 
             // If capping is enabled for this request, get the service's dictionary cached items.
@@ -266,7 +248,7 @@ export default class APIpeline {
             if (shouldCap) {
                 const capLimit = serviceDefinition.capLimit || this._APIOptions.capLimit;
                 const serviceDictionaryKey = this._getServiceDictionaryKey(service);
-                let dictionary = await this._APICacheDriver.getItem(serviceDictionaryKey);
+                let dictionary = await this._APIDriver.getItem(serviceDictionaryKey);
                 if (dictionary) {
                     dictionary = JSON.parse(dictionary);
                     const cachedItemsCount = Object.keys(dictionary).length;
@@ -277,8 +259,8 @@ export default class APIpeline {
                         );
                         const { key } = this._getOldestCachedItem(dictionary);
                         delete dictionary[key];
-                        await this._APICacheDriver.removeItem(this._getCacheObjectKey(key));
-                        this._APICacheDriver.setItem(serviceDictionaryKey, JSON.stringify(dictionary));
+                        await this._APIDriver.removeItem(this._getCacheObjectKey(key));
+                        this._APIDriver.setItem(serviceDictionaryKey, JSON.stringify(dictionary));
                     }
                 }
             }
@@ -298,20 +280,17 @@ export default class APIpeline {
      * @param {string} requestId
      * @param {string} fullPath
      * @returns {Promise<ICachedData>}
-     * @memberof APIpeline
+     * @memberof OfflineFirstAPI
      */
-    private async _getCachedData (service: string, requestId: string, fullPath: string, shouldUseCache: boolean): Promise<ICachedData> {
-        if (!this._APICacheDriver || !shouldUseCache) {
-            return { success: false };
-        }
-        let serviceDictionary = await this._APICacheDriver.getItem(this._getServiceDictionaryKey(service));
+    private async _getCachedData (service: string, requestId: string, fullPath: string): Promise<ICachedData> {
+        let serviceDictionary = await this._APIDriver.getItem(this._getServiceDictionaryKey(service));
         serviceDictionary = JSON.parse(serviceDictionary) || {};
 
         const expiration = serviceDictionary[requestId];
         if (expiration) {
             this._log(`${fullPath} already cached, expiring at : ${expiration}`);
             try {
-                const rawCachedData = await this._APICacheDriver.getItem(this._getCacheObjectKey(requestId));
+                const rawCachedData = await this._APIDriver.getItem(this._getCacheObjectKey(requestId));
                 const parsedCachedData = JSON.parse(rawCachedData);
                 if (expiration > Date.now()) {
                     return { success: true, fresh: true, data: parsedCachedData };
@@ -336,12 +315,10 @@ export default class APIpeline {
      * @param {IAPIService} serviceDefinition
      * @param {IFetchOptions} options
      * @returns {boolean}
-     * @memberof APIpeline
+     * @memberof OfflineFirstAPI
      */
     private _shouldUseCache (serviceDefinition: IAPIService, options: IFetchOptions): boolean {
-        if (!this._APICacheDriver) {
-            return false;
-        } else if (options && typeof options.disableCache !== 'undefined') {
+        if (options && typeof options.disableCache !== 'undefined') {
             return !options.disableCache;
         } else if (serviceDefinition && typeof serviceDefinition.disableCache !== 'undefined') {
             return !serviceDefinition.disableCache;
@@ -357,19 +334,19 @@ export default class APIpeline {
      * @param {string} requestId
      * @param {number} expiration
      * @returns {Promise<boolean>}
-     * @memberof APIpeline
+     * @memberof OfflineFirstAPI
      */
     private async _addKeyToServiceDictionary (service: string, requestId: string, expiration: number): Promise<boolean> {
         try {
             const serviceDictionaryKey = this._getServiceDictionaryKey(service);
-            let dictionary = await this._APICacheDriver.getItem(serviceDictionaryKey);
+            let dictionary = await this._APIDriver.getItem(serviceDictionaryKey);
             if (!dictionary) {
                 dictionary = {};
             } else {
                 dictionary = JSON.parse(dictionary);
             }
             dictionary[requestId] = expiration;
-            this._APICacheDriver.setItem(serviceDictionaryKey, JSON.stringify(dictionary));
+            this._APIDriver.setItem(serviceDictionaryKey, JSON.stringify(dictionary));
             return true;
         } catch (err) {
             throw new Error(err);
@@ -382,7 +359,7 @@ export default class APIpeline {
      * @private
      * @param {ICacheDictionary} dictionary
      * @returns {*}
-     * @memberof APIpeline
+     * @memberof OfflineFirstAPI
      */
     private _getOldestCachedItem (dictionary: ICacheDictionary): any {
         let oldest;
@@ -405,14 +382,14 @@ export default class APIpeline {
      * @private
      * @param {string} service
      * @returns {Promise<string[]>}
-     * @memberof APIpeline
+     * @memberof OfflineFirstAPI
      */
     private async _getAllKeysForService (service: string): Promise<string[]> {
         try {
             let keys = [];
             const serviceDictionaryKey = this._getServiceDictionaryKey(service);
             keys.push(serviceDictionaryKey);
-            let dictionary = await this._APICacheDriver.getItem(serviceDictionaryKey);
+            let dictionary = await this._APIDriver.getItem(serviceDictionaryKey);
             if (dictionary) {
                 dictionary = JSON.parse(dictionary);
                 const dictionaryKeys = Object.keys(dictionary).map((key: string) => `${this._APIOptions.cachePrefix}:${key}`);
@@ -429,7 +406,7 @@ export default class APIpeline {
      * @private
      * @param {string} service
      * @returns {string}
-     * @memberof APIPeline
+     * @memberof OfflineFirstAP
      */
     private _getServiceDictionaryKey (service: string): string {
         return `${this._APIOptions.cachePrefix}:dictionary:${service}`;
@@ -440,7 +417,7 @@ export default class APIpeline {
      * @private
      * @param {string} requestId
      * @returns {string}
-     * @memberof APIPeline
+     * @memberof OfflineFirstAP
      */
     private _getCacheObjectKey (requestId: string): string {
         return `${this._APIOptions.cachePrefix}:${requestId}`;
@@ -453,7 +430,7 @@ export default class APIpeline {
      * @param {IAPIService} serviceDefinition
      * @param {IFetchOptions} [options]
      * @returns {Promise<any>}
-     * @memberof APIpeline
+     * @memberof OfflineFirstAPI
      */
     private async _applyMiddlewares (
         serviceDefinition: IAPIService,
@@ -495,6 +472,7 @@ export default class APIpeline {
                 requestStringId += JSON.stringify(mergedOptions[key]);
             }
         });
+
         _sha.update(requestStringId);
         return _sha.getHash('HEX');
     }
@@ -505,7 +483,7 @@ export default class APIpeline {
      * @param {IAPIService} serviceDefinition
      * @param {IFetchOptions} [options]
      * @returns {string}
-     * @memberof APIpeline
+     * @memberof OfflineFirstAPI
      */
     private _constructPath (serviceDefinition: IAPIService, options?: IFetchOptions): IMiddlewarePaths {
         const domainKey = (options && options.domain) || serviceDefinition.domain;
@@ -530,10 +508,9 @@ export default class APIpeline {
      * @param {IAPIService} serviceDefinition
      * @param {IFetchOptions} [options]
      * @returns {string}
-     * @memberof APIpeline
+     * @memberof OfflineFirstAPI
      */
     private _parsePath (serviceDefinition: IAPIService, options?: IFetchOptions): any {
-        const { encodeParameters } = this._APIOptions;
         let path = serviceDefinition.path;
         let parsedQueryParameters = '';
 
@@ -542,9 +519,6 @@ export default class APIpeline {
             for (let i in pathParameters) {
                 if (typeof pathParameters[i] === 'undefined') {
                     continue;
-                }
-                if (encodeParameters) {
-                    pathParameters[i] = encodeURIComponent(pathParameters[i]);
                 }
                 path = path.replace(`:${i}`, pathParameters[i]);
             }
@@ -555,9 +529,6 @@ export default class APIpeline {
             for (let i in queryParameters) {
                 if (typeof queryParameters[i] === 'undefined') {
                     continue;
-                }
-                if (encodeParameters) {
-                    queryParameters[i] = encodeURIComponent(queryParameters[i]);
                 }
                 parsedQueryParameters += insertedQueryParameters === 0 ?
                     `?${i}=${queryParameters[i]}` :
@@ -576,7 +547,7 @@ export default class APIpeline {
      * @private
      * @param {IAPIOptions} options
      * @returns {IAPIOptions}
-     * @memberof APIpeline
+     * @memberof OfflineFirstAPI
      */
     private _mergeAPIOptionsWithDefaultValues (options: IAPIOptions): IAPIOptions {
         return {
@@ -595,20 +566,20 @@ export default class APIpeline {
      * @private
      * @param {IAPIServices} services
      * @returns {IAPIServices}
-     * @memberof APIpeline
+     * @memberof OfflineFirstAPI
      */
     private _mergeServicesWithDefaultValues (services: IAPIServices): IAPIServices {
         return _mapValues(services, (service: IAPIService, serviceName: string) => {
             if (service.domain && typeof this._APIOptions.domains[service.domain] === 'undefined') {
                 throw new Error(
                     `Domain key ${service.domain} specified for service ${serviceName} hasn't been declared. \n` +
-                    'Please provide it in your APIpeline parameters or leave it blank to use the default one.'
+                    'Please provide it in your OfflineFirstAPI parameters or leave it blank to use the default one.'
                 );
             }
             if (service.prefix && typeof this._APIOptions.prefixes[service.prefix] === 'undefined') {
                 throw new Error(
                     `Prefix key ${service.domain} specified for service ${serviceName} hasn't been declared. \n` +
-                    'Please provide it in your APIpeline parameters or leave it blank to use the default one.'
+                    'Please provide it in your OfflineFirstAPI parameters or leave it blank to use the default one.'
                 );
             }
             return {
@@ -624,7 +595,7 @@ export default class APIpeline {
      * @param {IAPIService} serviceDefinition
      * @param {boolean} fetchHeaders
      * @param {IFetchOptions} [options]
-     * @memberof APIpeline
+     * @memberof OfflineFirstAPI
      */
     private _logNetwork (
         serviceDefinition: IAPIService,
@@ -647,14 +618,14 @@ export default class APIpeline {
      * @private
      * @param {string} msg
      * @param {*} [value]
-     * @memberof APIpeline
+     * @memberof OfflineFirstAPI
      */
     private _log (msg: string, value?: any): void {
         if (this._APIOptions.debugAPI) {
             if (value) {
-                console.log(`APIpeline | ${msg}`, value);
+                console.log(`OfflineFirstAPI | ${msg}`, value);
             } else {
-                console.log(`APIpeline | ${msg}`);
+                console.log(`OfflineFirstAPI | ${msg}`);
             }
         }
     }
