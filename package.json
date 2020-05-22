@@ -1,5 +1,5 @@
 {
-  "name": "apipeline",
+  "name": "react-native-offline-api",
   "version": "3.0.1",
   "description": "Feature-rich and pluggable offline-first API wrapper for the browser, node.js and react-native. Easily wire-up your API and make your app work offline in minutes !",
   "main": "./dist/index.js",
@@ -10,7 +10,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Exilz/apipeline.git"
+    "url": "git+https://github.com/codGmer/react-native-offline-api.git"
   },
   "keywords": [
     "react",
